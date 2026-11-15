@@ -38,7 +38,7 @@ The form relies on the rules below. The Linux adapters follow them, and `tests/t
 6. The sound stops when the app exits or crashes.
 7. The delay stays low. The Linux adapter buffers about 10 ms.
 8. `set_volume(volume_percent)` works whether or not sound is playing. The value applies at once and to every later `start()`; 100 keeps the microphone's level, and the slider goes up to 150.
-9. If `filters` asks for a filter the adapter cannot provide, `start()` raises `AudioLoopbackError` with a message that names it. The form then shows the message and turns the toggle back OFF.
+9. `filter_support()` reports which filters the adapter can run on this computer, with a reason for each one it cannot; the form greys those out and shows the reason in their tooltips. `start()` still refuses an unavailable filter with an `AudioLoopbackError`; `FilterSupport.problems_with()` builds the message.
 
 `AudioDeviceWatcher`:
 
@@ -174,7 +174,7 @@ import sounddevice
 from PyQt5.QtCore import QTimer
 
 from mic2speaker.audio.audio_device import AudioDevice
-from mic2speaker.audio.audio_filters import AudioFilters
+from mic2speaker.audio.audio_filters import AudioFilters, FilterAvailability, FilterSupport
 from mic2speaker.audio.audio_loopback import AudioLoopback, AudioLoopbackError
 from mic2speaker.audio.windows_wasapi import INPUT_CHANNELS_KEY, OUTPUT_CHANNELS_KEY, find_wasapi_device_index
 
@@ -194,6 +194,7 @@ class WindowsAudioLoopback(AudioLoopback):
     SPEAKER_CHANNELS = 2
     HEALTH_CHECK_INTERVAL_MS = 500
     DEVICE_GONE_REASON = "the microphone or speaker is no longer available."
+    FILTERS_NOT_YET_REASON = "Not available on Windows yet."
 
     def __init__(self) -> None:
         """Create a loopback that is not playing yet. A QApplication must exist already."""
@@ -213,10 +214,11 @@ class WindowsAudioLoopback(AudioLoopback):
     ) -> None:
         """Open a stream from ``microphone`` to ``speaker`` and start it."""
         self.stop()
-        if filters.any_enabled():
-            filter_names = filters.enabled_names()
-            filter_list = ", ".join(filter_names)
-            raise AudioLoopbackError(f"not available on Windows yet: {filter_list}")
+        support = self.filter_support()
+        problems = support.problems_with(filters)
+        if problems:
+            problem_text = " ".join(problems)
+            raise AudioLoopbackError(problem_text)
         microphone_index = find_wasapi_device_index(microphone.system_name, INPUT_CHANNELS_KEY)
         speaker_index = find_wasapi_device_index(speaker.system_name, OUTPUT_CHANNELS_KEY)
         if microphone_index is None or speaker_index is None:
@@ -261,6 +263,11 @@ class WindowsAudioLoopback(AudioLoopback):
         """Remember the volume; the audio thread uses it from the next block of sound on."""
         self._volume_factor = volume_percent / 100
 
+    def filter_support(self) -> FilterSupport:
+        """Report every filter as not available yet, so the form greys them out."""
+        not_yet = FilterAvailability(is_available=False, reason=self.FILTERS_NOT_YET_REASON)
+        return FilterSupport(echo_canceller=not_yet, frequency_shifter=not_yet, noise_gate=not_yet)
+
     def _copy_microphone_to_speaker(self, microphone_block, speaker_block, frame_count, time_info, status) -> None:
         """Copy one block of sound at the chosen volume. Runs on PortAudio's audio thread.
 
@@ -286,7 +293,7 @@ Things to check on a real Windows machine:
 - Identical device names. Two identical USB devices get the same name, and this code always picks the first one. Add a number to `system_name` if that matters.
 - Stereo microphones. `MICROPHONE_CHANNELS = 1` records the first channel only, so a stereo microphone plays its left channel on both speaker channels.
 
-Filters come later on Windows. This first version refuses them (loopback rule 9), so the Filters menu shows an error instead of silently doing nothing. A noise gate fits inside `_copy_microphone_to_speaker`: compare each block's level with a threshold and keep the gate open for a hold time after the voice drops below it. An echo canceller or a frequency shifter needs a signal-processing library with Python bindings, such as SpeexDSP or WebRTC's audio processing module, and has to be measured on real hardware the way the Linux tests measure the noise gate.
+Filters come later on Windows. This first version reports all three as not available (loopback rule 9), so the form greys them out with the reason in their tooltips. A noise gate fits inside `_copy_microphone_to_speaker`: compare each block's level with a threshold and keep the gate open for a hold time after the voice drops below it. An echo canceller or a frequency shifter needs a signal-processing library with Python bindings, such as SpeexDSP or WebRTC's audio processing module, and has to be measured on real hardware the way the Linux tests measure the noise gate.
 
 ## Step 5: WindowsAudioDeviceWatcher
 
@@ -386,7 +393,7 @@ cd /d "%PROJECT_DIR%"
 - [ ] `mic2speaker/audio/windows_wasapi.py`
 - [ ] `WindowsAudioDeviceProvider` follows the provider rules
 - [ ] `WindowsAudioLoopback` follows the loopback rules, with unplugging checked on real hardware
-- [ ] `WindowsAudioLoopback.set_volume()` works, and filters it cannot provide give a clear error
+- [ ] `WindowsAudioLoopback.set_volume()` works, and `filter_support()` reports the filters it cannot run
 - [ ] `WindowsAudioDeviceWatcher`, as a do-nothing first version or with `IMMNotificationClient`
 - [ ] `app.py` picks the Windows adapters on `win32`
 - [ ] `run.bat`

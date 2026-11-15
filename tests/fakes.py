@@ -5,7 +5,7 @@ from collections.abc import Callable
 from mic2speaker.audio.audio_device import AudioDevice
 from mic2speaker.audio.audio_device_provider import AudioDeviceError, AudioDeviceProvider
 from mic2speaker.audio.audio_device_watcher import AudioDeviceWatcher
-from mic2speaker.audio.audio_filters import AudioFilters
+from mic2speaker.audio.audio_filters import AudioFilters, FilterSupport
 from mic2speaker.audio.audio_loopback import AudioLoopback, AudioLoopbackError
 
 
@@ -42,6 +42,8 @@ class FakeAudioLoopback(AudioLoopback):
         volume_percent: The last volume passed to set_volume(), or None.
         start_error_message: When set, start() fails with this message.
         volume_error_message: When set, set_volume() fails with this message.
+        filter_support_result: What filter_support() returns; every filter
+            is available unless the test says otherwise.
     """
 
     def __init__(self) -> None:
@@ -50,6 +52,7 @@ class FakeAudioLoopback(AudioLoopback):
         self.volume_percent: int | None = None
         self.start_error_message: str | None = None
         self.volume_error_message: str | None = None
+        self.filter_support_result = FilterSupport()
         self._running = False
         self._on_stopped: Callable[[str], None] | None = None
 
@@ -81,6 +84,10 @@ class FakeAudioLoopback(AudioLoopback):
         if self.volume_error_message is not None:
             raise AudioLoopbackError(self.volume_error_message)
         self.volume_percent = volume_percent
+
+    def filter_support(self) -> FilterSupport:
+        """Return the filter support the test set."""
+        return self.filter_support_result
 
     def stop_by_itself(self, reason: str) -> None:
         """Pretend the sound stopped on its own, for example because a device was unplugged."""

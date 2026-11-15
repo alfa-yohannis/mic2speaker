@@ -14,10 +14,12 @@ from collections.abc import Callable
 from PyQt5.QtCore import QProcess
 
 from mic2speaker.audio.audio_device import AudioDevice
-from mic2speaker.audio.audio_filters import AudioFilters
+from mic2speaker.audio.audio_filters import AudioFilters, FilterSupport
 from mic2speaker.audio.audio_loopback import AudioLoopback, AudioLoopbackError
 from mic2speaker.audio.linux_child_process import command_that_ends_with_app
+from mic2speaker.audio.linux_filter_config import ladspa_directories
 from mic2speaker.audio.linux_filter_process import LinuxFilterProcess
+from mic2speaker.audio.linux_filter_support import LinuxFilterSupportChecker, default_library_directories
 from mic2speaker.audio.linux_node_names import LOOPBACK_NAME, PLAYBACK_STREAM_NAME
 from mic2speaker.audio.linux_pactl import PactlError, read_pactl_list, run_pactl
 
@@ -68,6 +70,7 @@ class LinuxAudioLoopback(AudioLoopback):
         if they do not start.
         """
         self.stop()
+        self._refuse_unavailable_filters(filters)
         pw_loopback_path = shutil.which(self.PW_LOOPBACK_COMMAND)
         if pw_loopback_path is None:
             raise AudioLoopbackError("pw-loopback is not installed. It comes with PipeWire.")
@@ -99,6 +102,23 @@ class LinuxAudioLoopback(AudioLoopback):
         self._volume_percent = volume_percent
         if self.is_running():
             self._apply_volume()
+
+    def filter_support(self) -> FilterSupport:
+        """Look for the files the filters need; see LinuxFilterSupportChecker."""
+        library_directories = default_library_directories()
+        plugin_directories = ladspa_directories()
+        checker = LinuxFilterSupportChecker(library_directories, plugin_directories)
+        return checker.check()
+
+    def _refuse_unavailable_filters(self, filters: AudioFilters) -> None:
+        """Raise AudioLoopbackError if a switched-on filter cannot run on this computer."""
+        if not filters.any_enabled():
+            return
+        support = self.filter_support()
+        problems = support.problems_with(filters)
+        if problems:
+            problem_text = " ".join(problems)
+            raise AudioLoopbackError(problem_text)
 
     def _build_command(self, capture_target_name: str, playback_target_name: str) -> list[str]:
         """Return the command line that copies sound from one node to the other.

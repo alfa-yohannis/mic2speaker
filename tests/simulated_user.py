@@ -1,6 +1,8 @@
 """A helper that operates the main window the way a person would."""
 
-from PyQt5.QtWidgets import QAction
+from PyQt5.QtCore import Qt
+from PyQt5.QtTest import QTest
+from PyQt5.QtWidgets import QAction, QSpinBox
 
 from mic2speaker.ui.device_combo_box import DeviceComboBox
 from mic2speaker.ui.main_window import MainWindow
@@ -20,6 +22,7 @@ class SimulatedUser:
         self._microphone_combo = window.findChild(DeviceComboBox, MainWindow.MICROPHONE_COMBO_NAME)
         self._speaker_combo = window.findChild(DeviceComboBox, MainWindow.SPEAKER_COMBO_NAME)
         self._volume_slider = window.findChild(VolumeSlider, MainWindow.VOLUME_SLIDER_NAME)
+        self._volume_box = window.findChild(QSpinBox, VolumeSlider.VALUE_BOX_NAME)
         self._toggle_button = window.findChild(ToggleButton, MainWindow.TOGGLE_BUTTON_NAME)
         self._redetect_action = window.findChild(QAction, MainWindow.REDETECT_ACTION_NAME)
         self._echo_canceller_action = window.findChild(QAction, MainWindow.ECHO_CANCELLER_ACTION_NAME)
@@ -36,19 +39,49 @@ class SimulatedUser:
 
     def toggle_echo_canceller(self) -> None:
         """Tick or untick Filters > Echo canceller."""
-        self._echo_canceller_action.trigger()
+        self._click_menu_item(self._echo_canceller_action)
 
     def toggle_frequency_shifter(self) -> None:
         """Tick or untick Filters > Frequency shifter."""
-        self._frequency_shifter_action.trigger()
+        self._click_menu_item(self._frequency_shifter_action)
 
     def toggle_noise_gate(self) -> None:
         """Tick or untick Filters > Noise gate."""
-        self._noise_gate_action.trigger()
+        self._click_menu_item(self._noise_gate_action)
+
+    def echo_canceller_item(self) -> QAction:
+        """Return the Filters > Echo canceller menu item, to look at its state."""
+        return self._echo_canceller_action
+
+    def frequency_shifter_item(self) -> QAction:
+        """Return the Filters > Frequency shifter menu item, to look at its state."""
+        return self._frequency_shifter_action
+
+    def noise_gate_item(self) -> QAction:
+        """Return the Filters > Noise gate menu item, to look at its state."""
+        return self._noise_gate_action
 
     def set_volume(self, volume_percent: int) -> None:
         """Drag the volume slider to ``volume_percent``."""
         self._volume_slider.set_volume(volume_percent)
+
+    def type_volume(self, volume_text: str) -> None:
+        """Type ``volume_text`` into the number box next to the slider and press Enter."""
+        self.type_into_volume_box(volume_text)
+        self.press_enter_in_volume_box()
+
+    def type_into_volume_box(self, volume_text: str) -> None:
+        """Replace the number in the volume box with ``volume_text``, without pressing Enter."""
+        self._volume_box.selectAll()
+        QTest.keyClicks(self._volume_box, volume_text)
+
+    def press_enter_in_volume_box(self) -> None:
+        """Press Enter in the volume box."""
+        QTest.keyClick(self._volume_box, Qt.Key_Return)
+
+    def slider_volume(self) -> int:
+        """Return where the volume slider stands, in percent."""
+        return self._volume_slider.volume()
 
     def pick_microphone(self, display_name: str) -> None:
         """Choose the microphone called ``display_name`` in the dropdown."""
@@ -90,6 +123,12 @@ class SimulatedUser:
     def selected_speaker_text(self) -> str:
         """Return the text of the selected speaker."""
         return self._speaker_combo.currentText()
+
+    @staticmethod
+    def _click_menu_item(menu_item: QAction) -> None:
+        """Click ``menu_item``. A greyed-out item ignores the click, as in the real menu."""
+        if menu_item.isEnabled():
+            menu_item.trigger()
 
     @staticmethod
     def _pick(combo: DeviceComboBox, display_name: str) -> None:

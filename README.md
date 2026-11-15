@@ -26,6 +26,8 @@ These steps take a Linux machine from nothing to hearing your own voice. They we
    | `setpriv` | `util-linux` | stops the sound if the app crashes (recommended) |
    | Python 3.10 or newer, with `venv` | `python3`, `python3-venv` | runs the app |
 
+   The filter packages are optional. Without them the app still plays sound, and the Filters menu greys out what this computer cannot run.
+
 2. Check that your desktop uses PipeWire:
 
    ```bash
@@ -50,8 +52,9 @@ These steps take a Linux machine from nothing to hearing your own voice. They we
 
 - Both lists mark the system default device with "(default)" and select it when the app starts.
 - Click the toggle to switch the sound ON or OFF. Closing the window also stops the sound.
-- The Volume slider sets how loud the speaker plays the microphone, from 0 to 150 %. It takes effect at once.
+- The Volume slider sets how loud the speaker plays the microphone, from 0 to 150 %. Drag it, or type an exact number in the box next to it and press Enter. The new volume takes effect at once.
 - The Filters menu switches the echo canceller, the frequency shifter, and the noise gate on and off. While the sound is on, a change takes effect at once, and the status bar lists the active filters.
+- A filter that this computer cannot run is greyed out and marked "(not available)". Hover over it to see what is missing, for example the swh-plugins package.
 - While the sound is on, picking another device in either list moves the sound to it right away.
 - The lists update by themselves when a device is plugged in or out, or when the system default device changes. Devices > Redetect inputs and outputs (F5) reads them again by hand and says how many devices it found.
 - If a device in use is unplugged, the sound stops and is never moved to another speaker. The toggle goes back to OFF and the status bar says why.
@@ -76,6 +79,30 @@ A good order to try: lower the volume until the howl stops, tick the noise gate 
 - If the sound crackles, raise `LATENCY_MS` in [mic2speaker/audio/linux_audio_loopback.py](mic2speaker/audio/linux_audio_loopback.py) from 10 to 20. Lower values give less delay.
 - The PyQt5 from pip brings its own copy of Qt, so the window uses Qt's Fusion style rather than your desktop theme.
 
+## How it works
+
+```mermaid
+%%{init: {"theme": "base", "themeVariables": {"lineColor": "#64748b", "primaryTextColor": "#000000", "primaryBorderColor": "#000000", "textColor": "#000000", "titleColor": "#000000", "edgeLabelBackground": "#ffffff", "fontSize": "14px"}}}%%
+flowchart LR
+    microphone(["<b>Microphone</b>"]) --> filters["<b>Ticked filters<br/>optional</b>"]
+    filters --> pw_loopback["<b>pw-loopback<br/>10 ms buffer, volume</b>"]
+    pw_loopback --> speaker(["<b>Speaker</b>"])
+    form["<b>Mic2Speaker form</b>"] -.->|"starts and stops"| filters
+    form -.->|"starts and stops"| pw_loopback
+
+    classDef device_part fill:#ffedd5,stroke:#000000,color:#000000
+    classDef filter_part fill:#dcfce7,stroke:#000000,color:#000000
+    classDef program_part fill:#dbeafe,stroke:#000000,color:#000000
+    classDef form_part fill:#fce7f3,stroke:#000000,color:#000000
+
+    class microphone,speaker device_part
+    class filters filter_part
+    class pw_loopback program_part
+    class form form_part
+```
+
+The form starts PipeWire's `pw-loopback`, which copies the sound from the microphone to the speaker. The ticked filters run in their own PipeWire process in between. All audio code sits behind three adapter interfaces, with one set of adapters per operating system. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) has the component, class, sequence, and activity diagrams.
+
 ## Project layout
 
 ```
@@ -98,13 +125,14 @@ A good order to try: lower the volume until the howl stops, tick the noise gate 
 │   │   ├── linux_audio_loopback.py          Linux adapter, runs pw-loopback and sets the volume
 │   │   ├── linux_filter_config.py           builds the PipeWire config for the filters
 │   │   ├── linux_filter_process.py          runs the filters in a "pipewire -c" process
+│   │   ├── linux_filter_support.py          checks which filters this computer can run
 │   │   ├── linux_child_process.py           makes helper programs end with the app
 │   │   ├── linux_node_names.py              names of the PipeWire nodes the app creates
 │   │   └── linux_pactl.py                   runs pactl for the Linux adapters
 │   └── ui/
 │       ├── main_window.py        the form: menus, dropdowns, volume, toggle, status bar
 │       ├── device_combo_box.py   dropdown of AudioDevice items
-│       ├── volume_slider.py      volume slider with its value in percent
+│       ├── volume_slider.py      volume slider with a box for typing an exact value
 │       └── toggle_button.py      the big ON/OFF button
 ├── tests/
 └── docs/
@@ -122,16 +150,18 @@ A good order to try: lower the volume until the howl stops, tick the noise gate 
 | `tests/test_main_window.py` | the form, driven through `SimulatedUser` with fake adapters | no |
 | `tests/test_linux_audio_device_provider.py` | how pactl's output is read, with pactl's answers faked | no |
 | `tests/test_linux_audio_device_watcher.py` | which `pactl subscribe` lines count as device changes | no |
+| `tests/test_audio_filters.py` | which switched-on filters cannot run | no |
+| `tests/test_linux_filter_support.py` | which filters a pretend computer can run, judged by the files it has | no |
 | `tests/test_linux_filter_config.py` | the PipeWire config built for each combination of filters | no |
 | `tests/test_linux_audio_integration.py` | the Linux adapters and filters against the real PipeWire server, including test tones through the noise gate and the frequency shifter | PipeWire, but no sound |
 
-The integration tests create temporary virtual devices (silent microphones, a microphone that plays test tones, and speakers that play into nothing), so nothing reaches your real speakers, and they remove them afterwards. They carry the `integration` marker: skip them with `-m "not integration"`. They skip themselves when `pactl` or `pw-loopback` is missing.
+The integration tests create temporary virtual devices (silent microphones, a microphone that plays test tones, and speakers that play into nothing), so nothing reaches your real speakers, and they remove them afterwards. They carry the `integration` marker: skip them with `-m "not integration"`. They skip themselves when `pactl` or `pw-loopback` is missing. A test of a filter this computer cannot run is skipped with the reason. All of them are skipped while another Mic2Speaker plays sound, because its streams have the same names.
 
 ## Documentation
 
 | Document | Contents |
 |---|---|
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | how the classes fit together and what happens when you click ON |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | how the parts fit together, with component, class, sequence, and activity diagrams |
 | [docs/WINDOWS.md](docs/WINDOWS.md) | how to add Windows support |
 
 ## Code style

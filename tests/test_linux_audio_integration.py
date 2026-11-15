@@ -221,6 +221,16 @@ def record_speaker(speaker: AudioDevice) -> bytes:
     return completed_process.stdout
 
 
+def skip_unless_supported(filters: AudioFilters) -> None:
+    """Skip the test if this computer cannot run one of ``filters``, giving the reason."""
+    loopback = LinuxAudioLoopback()
+    support = loopback.filter_support()
+    problems = support.problems_with(filters)
+    if problems:
+        problem_text = " ".join(problems)
+        pytest.skip(problem_text)
+
+
 class VirtualDevices:
     """Temporary virtual devices on the PipeWire server."""
 
@@ -309,6 +319,15 @@ class ChangeCounter:
     def record(self) -> None:
         """Use this method as the on_devices_changed callback."""
         self.count += 1
+
+
+@pytest.fixture(autouse=True)
+def no_other_mic2speaker_playing():
+    """Skip while another Mic2Speaker plays sound, because its streams and devices have our names."""
+    other_playback_streams = sinks_written_by(PLAYBACK_STREAM_NAME)
+    other_virtual_devices = own_virtual_devices()
+    if other_playback_streams or other_virtual_devices:
+        pytest.skip("Another Mic2Speaker is playing sound. Switch it OFF and run the tests again.")
 
 
 @pytest.fixture
@@ -427,14 +446,20 @@ def test_sound_stops_when_the_app_is_killed(virtual_devices):
         TEST_MICROPHONE.system_name, TEST_SPEAKER_A.system_name,
     ]
     app_process = subprocess.Popen(command, stdout=subprocess.PIPE, text=True, cwd=PROJECT_DIR)
-    first_line = app_process.stdout.readline()
-    assert first_line.strip() == "STARTED"
-    assert wait_until(lambda: sinks_written_by(PLAYBACK_STREAM_NAME) == [TEST_SPEAKER_A.system_name])
+    try:
+        first_line = app_process.stdout.readline()
+        assert first_line.strip() == "STARTED"
+        assert wait_until(lambda: sinks_written_by(PLAYBACK_STREAM_NAME) == [TEST_SPEAKER_A.system_name])
 
-    app_process.kill()
-    app_process.wait()
+        app_process.kill()
+        app_process.wait()
 
-    assert wait_until(lambda: sinks_written_by(PLAYBACK_STREAM_NAME) == [])
+        assert wait_until(lambda: sinks_written_by(PLAYBACK_STREAM_NAME) == [])
+    finally:
+        # A failed assertion must not leave the pretend app running.
+        if app_process.poll() is None:
+            app_process.kill()
+            app_process.wait()
 
 
 def test_volume_is_applied_at_start_and_while_playing(virtual_devices, loopback):
@@ -450,9 +475,32 @@ def test_volume_is_applied_at_start_and_while_playing(virtual_devices, loopback)
     assert wait_until(lambda: playback_volume_text() == "70%")
 
 
+def test_every_filter_reported_as_available_can_start(virtual_devices, loopback):
+    support = loopback.filter_support()
+    filters_to_try = [
+        (AudioFilters(echo_canceller=True), support.echo_canceller),
+        (AudioFilters(frequency_shifter=True), support.frequency_shifter),
+        (AudioFilters(noise_gate=True), support.noise_gate),
+    ]
+    stop_recorder = StopRecorder()
+    tried_count = 0
+    for filters, availability in filters_to_try:
+        if not availability.is_available:
+            continue
+        loopback.start(TEST_MICROPHONE, TEST_SPEAKER_A, filters, on_stopped=stop_recorder.record)
+        assert wait_until(lambda: sinks_written_by(PLAYBACK_STREAM_NAME) == [TEST_SPEAKER_A.system_name])
+        loopback.stop()
+        tried_count += 1
+
+    if tried_count == 0:
+        pytest.skip("No filter is available on this computer.")
+    assert stop_recorder.reasons == []
+
+
 def test_noise_gate_and_shifter_sit_between_the_microphone_and_the_speaker(virtual_devices, loopback):
     stop_recorder = StopRecorder()
     filters = AudioFilters(noise_gate=True, frequency_shifter=True)
+    skip_unless_supported(filters)
 
     loopback.start(TEST_MICROPHONE, TEST_SPEAKER_A, filters, on_stopped=stop_recorder.record)
 
@@ -464,6 +512,7 @@ def test_noise_gate_and_shifter_sit_between_the_microphone_and_the_speaker(virtu
 def test_echo_canceller_compares_the_microphone_with_the_speaker(virtual_devices, loopback):
     stop_recorder = StopRecorder()
     filters = AudioFilters(echo_canceller=True)
+    skip_unless_supported(filters)
 
     loopback.start(TEST_MICROPHONE, TEST_SPEAKER_A, filters, on_stopped=stop_recorder.record)
 
@@ -476,6 +525,7 @@ def test_echo_canceller_compares_the_microphone_with_the_speaker(virtual_devices
 
 def test_stop_ends_the_filter_process_and_its_virtual_devices(virtual_devices, loopback):
     stop_recorder = StopRecorder()
+    skip_unless_supported(ALL_FILTERS)
     loopback.start(TEST_MICROPHONE, TEST_SPEAKER_A, ALL_FILTERS, on_stopped=stop_recorder.record)
     assert wait_until(lambda: sinks_written_by(PLAYBACK_STREAM_NAME) == [TEST_SPEAKER_A.system_name])
 
@@ -488,6 +538,7 @@ def test_stop_ends_the_filter_process_and_its_virtual_devices(virtual_devices, l
 
 def test_unplugging_the_speaker_with_all_filters_stops_everything(virtual_devices, loopback):
     stop_recorder = StopRecorder()
+    skip_unless_supported(ALL_FILTERS)
     loopback.start(TEST_MICROPHONE, TEST_SPEAKER_A, ALL_FILTERS, on_stopped=stop_recorder.record)
     assert wait_until(lambda: sinks_written_by(PLAYBACK_STREAM_NAME) == [TEST_SPEAKER_A.system_name])
 
@@ -502,6 +553,7 @@ def test_unplugging_the_speaker_with_all_filters_stops_everything(virtual_device
 def test_unplugging_the_microphone_with_filters_stops_everything(virtual_devices, loopback):
     stop_recorder = StopRecorder()
     filters = AudioFilters(noise_gate=True)
+    skip_unless_supported(filters)
     loopback.start(TEST_MICROPHONE, TEST_SPEAKER_A, filters, on_stopped=stop_recorder.record)
     assert wait_until(lambda: sinks_written_by(PLAYBACK_STREAM_NAME) == [TEST_SPEAKER_A.system_name])
 
@@ -515,6 +567,7 @@ def test_unplugging_the_microphone_with_filters_stops_everything(virtual_devices
 def test_noise_gate_blocks_a_quiet_tone_and_passes_a_loud_one(tone_microphone, tone_files, loopback):
     stop_recorder = StopRecorder()
     filters = AudioFilters(noise_gate=True)
+    skip_unless_supported(filters)
     loopback.start(TONE_MICROPHONE, TEST_SPEAKER_A, filters, on_stopped=stop_recorder.record)
     assert wait_until(lambda: sinks_written_by(PLAYBACK_STREAM_NAME) == [TEST_SPEAKER_A.system_name])
 
@@ -527,6 +580,7 @@ def test_noise_gate_blocks_a_quiet_tone_and_passes_a_loud_one(tone_microphone, t
 
 def test_frequency_shifter_keeps_the_volume(tone_microphone, tone_files, loopback):
     stop_recorder = StopRecorder()
+    skip_unless_supported(AudioFilters(frequency_shifter=True))
     loopback.start(TONE_MICROPHONE, TEST_SPEAKER_A, NO_FILTERS, on_stopped=stop_recorder.record)
     assert wait_until(lambda: sinks_written_by(PLAYBACK_STREAM_NAME) == [TEST_SPEAKER_A.system_name])
     level_without_filter = speaker_level_while_playing(tone_microphone, tone_files.loud)

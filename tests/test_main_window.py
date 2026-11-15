@@ -3,7 +3,7 @@
 import pytest
 
 from mic2speaker.audio.audio_device import AudioDevice
-from mic2speaker.audio.audio_filters import AudioFilters
+from mic2speaker.audio.audio_filters import AudioFilters, FilterAvailability, FilterSupport
 from mic2speaker.ui.main_window import MainWindow
 from tests.fakes import FakeAudioLoopback, FakeDeviceProvider, FakeDeviceWatcher
 from tests.simulated_user import SimulatedUser
@@ -15,6 +15,8 @@ BUILT_IN_SPEAKER = AudioDevice("alsa_output.builtin", "Built-in Speaker")
 USB_SPEAKER = AudioDevice("alsa_output.usb", "USB Speaker", is_default=True)
 HDMI_SPEAKER = AudioDevice("alsa_output.hdmi", "HDMI Speaker")
 DEVICE_GONE_REASON = "the microphone or speaker is no longer available."
+MISSING_GATE_REASON = "Needs gate_1410.so from the swh-plugins package."
+MISSING_GATE = FilterAvailability(is_available=False, reason=MISSING_GATE_REASON)
 
 
 @pytest.fixture
@@ -212,6 +214,39 @@ class TestFilters:
 
         assert audio_loopback.started_filters == [AudioFilters(frequency_shifter=True), AudioFilters()]
 
+    def test_filter_items_say_what_they_do(self, user):
+        noise_gate_item = user.noise_gate_item()
+
+        assert noise_gate_item.isEnabled()
+        assert noise_gate_item.toolTip() == MainWindow.NOISE_GATE_TIP
+
+    def test_filter_this_computer_cannot_run_is_greyed_out_with_the_reason(
+        self, qt_application, device_provider, device_watcher
+    ):
+        audio_loopback = FakeAudioLoopback()
+        audio_loopback.filter_support_result = FilterSupport(noise_gate=MISSING_GATE)
+
+        window = MainWindow(device_provider, audio_loopback, device_watcher)
+        user = SimulatedUser(window)
+
+        noise_gate_item = user.noise_gate_item()
+        assert not noise_gate_item.isEnabled()
+        assert noise_gate_item.text() == "&Noise gate (not available)"
+        assert noise_gate_item.toolTip() == MISSING_GATE_REASON
+        assert user.echo_canceller_item().isEnabled()
+        assert user.frequency_shifter_item().isEnabled()
+
+    def test_greyed_out_filter_is_never_used(self, qt_application, device_provider, device_watcher):
+        audio_loopback = FakeAudioLoopback()
+        audio_loopback.filter_support_result = FilterSupport(noise_gate=MISSING_GATE)
+        window = MainWindow(device_provider, audio_loopback, device_watcher)
+        user = SimulatedUser(window)
+
+        user.toggle_noise_gate()
+        user.click_toggle()
+
+        assert audio_loopback.started_filters == [AudioFilters()]
+
     def test_missing_filter_turns_the_toggle_back_off_and_says_why(self, user, audio_loopback):
         audio_loopback.start_error_message = "gate_1410.so was not found."
         user.toggle_noise_gate()
@@ -232,6 +267,22 @@ class TestVolume:
 
         assert audio_loopback.volume_percent == 40
         assert user.volume_text() == "40%"
+
+    def test_typing_a_number_sets_that_exact_volume(self, user, audio_loopback):
+        user.type_volume("73")
+
+        assert audio_loopback.volume_percent == 73
+        assert user.volume_text() == "73%"
+        assert user.slider_volume() == 73
+
+    def test_typed_number_takes_effect_when_enter_is_pressed(self, user, audio_loopback):
+        user.type_into_volume_box("73")
+
+        assert audio_loopback.volume_percent == 100
+
+        user.press_enter_in_volume_box()
+
+        assert audio_loopback.volume_percent == 73
 
     def test_volume_can_go_above_100_percent(self, user, audio_loopback):
         user.set_volume(150)

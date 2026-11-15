@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 
 from mic2speaker.audio.audio_device import AudioDevice
-from mic2speaker.audio.audio_filters import AudioFilters
+from mic2speaker.audio.audio_filters import AudioFilters, FilterSupport
 
 
 class AudioLoopbackError(Exception):
@@ -39,7 +39,15 @@ class AudioLoopback(ABC):
         ``stop()`` ends the sound.
 
         Raises AudioLoopbackError if the sound or one of the filters cannot
-        be started.
+        be started, including filters that filter_support() reports as not
+        available.
+        """
+
+    @abstractmethod
+    def filter_support(self) -> FilterSupport:
+        """Return which filters this computer can run, and why the others cannot.
+
+        The form greys out the filters that cannot run and shows the reason.
         """
 
     @abstractmethod

@@ -6,7 +6,7 @@ from PyQt5.QtWidgets import QAction, QFormLayout, QMainWindow, QMenu, QMessageBo
 from mic2speaker.audio.audio_device import AudioDevice
 from mic2speaker.audio.audio_device_provider import AudioDeviceError, AudioDeviceProvider
 from mic2speaker.audio.audio_device_watcher import AudioDeviceWatcher
-from mic2speaker.audio.audio_filters import AudioFilters
+from mic2speaker.audio.audio_filters import AudioFilters, FilterAvailability
 from mic2speaker.audio.audio_loopback import AudioLoopback, AudioLoopbackError
 from mic2speaker.ui.device_combo_box import DeviceComboBox
 from mic2speaker.ui.toggle_button import ToggleButton
@@ -46,6 +46,7 @@ class MainWindow(QMainWindow):
     FREQUENCY_SHIFTER_TIP = "Shift the sound up 5 Hz so that feedback builds up more slowly."
     NOISE_GATE_TEXT = "&Noise gate"
     NOISE_GATE_TIP = "Mute the microphone while nobody speaks."
+    UNAVAILABLE_FILTER_SUFFIX = " (not available)"
 
     # Object names let tests find the widgets and the menu items with findChild().
     MICROPHONE_COMBO_NAME = "microphone_combo"
@@ -90,6 +91,7 @@ class MainWindow(QMainWindow):
         self._name_widgets()
         self._set_up_window()
         self._build_menu_bar()
+        self._show_filter_support()
         self._build_form()
         self._connect_signals()
         self._handle_volume_changed(AudioLoopback.DEFAULT_VOLUME_PERCENT)
@@ -146,6 +148,7 @@ class MainWindow(QMainWindow):
         redetect_action.triggered.connect(self.redetect_devices)
 
         filters_menu = menu_bar.addMenu("Fi&lters")
+        filters_menu.setToolTipsVisible(True)
         self._echo_canceller_action = self._add_filter_item(
             filters_menu, self.ECHO_CANCELLER_TEXT, self.ECHO_CANCELLER_TIP, self.ECHO_CANCELLER_ACTION_NAME
         )
@@ -161,13 +164,31 @@ class MainWindow(QMainWindow):
         about_action.triggered.connect(self._show_about_dialog)
 
     @staticmethod
-    def _add_filter_item(filters_menu: QMenu, text: str, status_tip: str, object_name: str) -> QAction:
-        """Add one tickable filter to the Filters menu and return it."""
+    def _add_filter_item(filters_menu: QMenu, text: str, description: str, object_name: str) -> QAction:
+        """Add one tickable filter to the Filters menu; hovering over it shows ``description``."""
         filter_action = filters_menu.addAction(text)
         filter_action.setCheckable(True)
-        filter_action.setStatusTip(status_tip)
+        filter_action.setToolTip(description)
+        filter_action.setStatusTip(description)
         filter_action.setObjectName(object_name)
         return filter_action
+
+    def _show_filter_support(self) -> None:
+        """Grey out the filters this computer cannot run, and say why when the mouse is over them."""
+        support = self._audio_loopback.filter_support()
+        self._mark_availability(self._echo_canceller_action, support.echo_canceller)
+        self._mark_availability(self._frequency_shifter_action, support.frequency_shifter)
+        self._mark_availability(self._noise_gate_action, support.noise_gate)
+
+    def _mark_availability(self, filter_action: QAction, availability: FilterAvailability) -> None:
+        """Disable ``filter_action`` if its filter cannot run, with the reason as its tooltip."""
+        if availability.is_available:
+            return
+        filter_action.setEnabled(False)
+        unavailable_text = filter_action.text() + self.UNAVAILABLE_FILTER_SUFFIX
+        filter_action.setText(unavailable_text)
+        filter_action.setToolTip(availability.reason)
+        filter_action.setStatusTip(availability.reason)
 
     def _build_form(self) -> None:
         """Lay out the dropdowns and the volume slider, with the toggle below them."""
