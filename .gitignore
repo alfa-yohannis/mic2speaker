@@ -1,0 +1,7 @@
+# Virtual environment created by run.sh
+.venv/
+
+# Python and pytest caches
+__pycache__/
+*.pyc
+.pytest_cache/
