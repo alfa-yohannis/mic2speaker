@@ -5,6 +5,7 @@ from collections.abc import Callable
 from mic2speaker.audio.audio_device import AudioDevice
 from mic2speaker.audio.audio_device_provider import AudioDeviceError, AudioDeviceProvider
 from mic2speaker.audio.audio_device_watcher import AudioDeviceWatcher
+from mic2speaker.audio.audio_filters import AudioFilters
 from mic2speaker.audio.audio_loopback import AudioLoopback, AudioLoopbackError
 
 
@@ -37,12 +38,18 @@ class FakeAudioLoopback(AudioLoopback):
 
     Attributes:
         started_routes: One (microphone, speaker) pair for every start() call.
+        started_filters: The filters of every start() call.
+        volume_percent: The last volume passed to set_volume(), or None.
         start_error_message: When set, start() fails with this message.
+        volume_error_message: When set, set_volume() fails with this message.
     """
 
     def __init__(self) -> None:
         self.started_routes: list[tuple[AudioDevice, AudioDevice]] = []
+        self.started_filters: list[AudioFilters] = []
+        self.volume_percent: int | None = None
         self.start_error_message: str | None = None
+        self.volume_error_message: str | None = None
         self._running = False
         self._on_stopped: Callable[[str], None] | None = None
 
@@ -50,12 +57,14 @@ class FakeAudioLoopback(AudioLoopback):
         self,
         microphone: AudioDevice,
         speaker: AudioDevice,
+        filters: AudioFilters,
         on_stopped: Callable[[str], None],
     ) -> None:
-        """Remember the route, or fail if the test set start_error_message."""
+        """Remember the route and filters, or fail if the test set start_error_message."""
         if self.start_error_message is not None:
             raise AudioLoopbackError(self.start_error_message)
         self.started_routes.append((microphone, speaker))
+        self.started_filters.append(filters)
         self._running = True
         self._on_stopped = on_stopped
 
@@ -66,6 +75,12 @@ class FakeAudioLoopback(AudioLoopback):
     def is_running(self) -> bool:
         """Return True between start() and stop()."""
         return self._running
+
+    def set_volume(self, volume_percent: int) -> None:
+        """Remember the volume, or fail if the test set volume_error_message."""
+        if self.volume_error_message is not None:
+            raise AudioLoopbackError(self.volume_error_message)
+        self.volume_percent = volume_percent
 
     def stop_by_itself(self, reason: str) -> None:
         """Pretend the sound stopped on its own, for example because a device was unplugged."""

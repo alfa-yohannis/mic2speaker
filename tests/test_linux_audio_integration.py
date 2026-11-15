@@ -1,27 +1,42 @@
 """Integration tests for the Linux adapters against the real PipeWire server.
 
-Each test creates temporary virtual devices: a silent microphone and
-speakers that play into nothing. No sound reaches the real speakers, and the
-virtual devices are removed again after each test. The tests are skipped when
-pactl or pw-loopback is missing.
+Each test creates temporary virtual devices: silent microphones, a
+microphone that plays test tones, and speakers that play into nothing. No
+sound reaches the real speakers, and the virtual devices are removed again
+after each test. The tests are skipped when pactl or pw-loopback is missing.
 """
 
 import json
+import math
 import os
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import time
+import wave
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 from PyQt5.QtWidgets import QApplication
 
 from mic2speaker.audio.audio_device import AudioDevice
+from mic2speaker.audio.audio_filters import AudioFilters
 from mic2speaker.audio.linux_audio_device_provider import LinuxAudioDeviceProvider
 from mic2speaker.audio.linux_audio_device_watcher import LinuxAudioDeviceWatcher
 from mic2speaker.audio.linux_audio_loopback import LinuxAudioLoopback
+from mic2speaker.audio.linux_node_names import (
+    CAPTURE_STREAM_NAME,
+    ECHO_CANCEL_CAPTURE_NAME,
+    ECHO_CANCEL_REFERENCE_NAME,
+    ECHO_CANCEL_SOURCE_NAME,
+    FILTERED_MICROPHONE_NAME,
+    FILTERS_CAPTURE_NAME,
+    OWN_DEVICE_PREFIX,
+    PLAYBACK_STREAM_NAME,
+)
 
 PACTL_PATH = shutil.which("pactl")
 PW_LOOPBACK_PATH = shutil.which("pw-loopback")
@@ -37,25 +52,37 @@ TEST_MICROPHONE = AudioDevice("m2s_test_microphone", "M2S-Test-Microphone")
 TEST_SPEAKER_A = AudioDevice("m2s_test_speaker_a", "M2S-Test-Speaker-A")
 TEST_SPEAKER_B = AudioDevice("m2s_test_speaker_b", "M2S-Test-Speaker-B")
 TEST_SPEAKER_C = AudioDevice("m2s_test_speaker_c", "M2S-Test-Speaker-C")
-CAPTURE_STREAM_NAME = "input.mic2speaker"
-PLAYBACK_STREAM_NAME = "output.mic2speaker"
+TONE_MICROPHONE = AudioDevice("m2s_test_tone_microphone", "M2S-Test-Tone-Microphone")
+TONE_INPUT_NAME = "m2s_test_tone_input"
+NO_FILTERS = AudioFilters()
+ALL_FILTERS = AudioFilters(echo_canceller=True, frequency_shifter=True, noise_gate=True)
+
 WAIT_TIMEOUT_SECONDS = 3.0
 WATCHER_RESTART_TIMEOUT_SECONDS = 5.0
 WATCHER_START_SECONDS = 0.5
 POLL_INTERVAL_SECONDS = 0.05
+
+SAMPLE_RATE = 48000
+TONE_FREQUENCY_HZ = 1000
+TONE_SECONDS = 2.0
+TONE_SETTLE_SECONDS = 0.5
+RECORD_SECONDS = "1"
+QUIET_TONE_DBFS = -70
+LOUD_TONE_DBFS = -20
 
 # Runs in a separate process: start the sound, say so, then wait to be killed.
 APP_THAT_GETS_KILLED = """
 import sys
 from PyQt5.QtCore import QCoreApplication
 from mic2speaker.audio.audio_device import AudioDevice
+from mic2speaker.audio.audio_filters import AudioFilters
 from mic2speaker.audio.linux_audio_loopback import LinuxAudioLoopback
 
 application = QCoreApplication(sys.argv)
 loopback = LinuxAudioLoopback()
 microphone = AudioDevice(sys.argv[1], "microphone")
 speaker = AudioDevice(sys.argv[2], "speaker")
-loopback.start(microphone, speaker, on_stopped=print)
+loopback.start(microphone, speaker, AudioFilters(), on_stopped=print)
 print("STARTED", flush=True)
 application.exec_()
 """
@@ -82,38 +109,55 @@ def device_names_by_index(kind: str) -> dict[int, str]:
     return names
 
 
-def capture_sources() -> list[str]:
-    """Return the names of the devices our capture stream reads from."""
+def sources_read_by(stream_name: str) -> list[str]:
+    """Return the names of the sources that the recording stream ``stream_name`` reads."""
     source_names = device_names_by_index("sources")
     connected = []
     for stream in read_pactl_list("source-outputs"):
-        if stream["properties"].get("node.name") == CAPTURE_STREAM_NAME:
+        if stream["properties"].get("node.name") == stream_name:
             source_name = source_names.get(stream["source"])
             connected.append(source_name)
     return connected
 
 
-def playback_sinks() -> list[str]:
-    """Return the names of the devices our playback stream writes to."""
+def sinks_written_by(stream_name: str) -> list[str]:
+    """Return the names of the sinks that the playback stream ``stream_name`` writes to."""
     sink_names = device_names_by_index("sinks")
     connected = []
     for stream in read_pactl_list("sink-inputs"):
-        if stream["properties"].get("node.name") == PLAYBACK_STREAM_NAME:
+        if stream["properties"].get("node.name") == stream_name:
             sink_name = sink_names.get(stream["sink"])
             connected.append(sink_name)
     return connected
 
 
-def our_pactl_subscribe_process_id() -> int | None:
-    """Return the id of the ``pactl subscribe`` process that this test process started."""
+def playback_volume_text() -> str | None:
+    """Return the volume of our playback stream, for example "40%", or None if it is not there."""
+    for stream in read_pactl_list("sink-inputs"):
+        if stream["properties"].get("node.name") == PLAYBACK_STREAM_NAME:
+            return stream["volume"]["front-left"]["value_percent"]
+    return None
+
+
+def own_virtual_devices() -> list[str]:
+    """Return the names of the virtual devices that Mic2Speaker's filters created."""
+    names = []
+    for kind in ("sources", "sinks"):
+        for device in read_pactl_list(kind):
+            if device["name"].startswith(OWN_DEVICE_PREFIX):
+                names.append(device["name"])
+    return names
+
+
+def child_process_ids(command_pattern: str) -> list[int]:
+    """Return the ids of this test process's children whose command line matches ``command_pattern``."""
     test_process_id = str(os.getpid())
-    command = ["pgrep", "-P", test_process_id, "-f", "pactl subscribe"]
+    command = ["pgrep", "-P", test_process_id, "-f", command_pattern]
     completed_process = subprocess.run(command, capture_output=True, text=True)
-    output = completed_process.stdout.strip()
-    if not output:
-        return None
-    first_line = output.splitlines()[0]
-    return int(first_line)
+    process_ids = []
+    for line in completed_process.stdout.splitlines():
+        process_ids.append(int(line))
+    return process_ids
 
 
 def wait_until(condition, timeout_seconds: float = WAIT_TIMEOUT_SECONDS) -> bool:
@@ -133,6 +177,48 @@ def keep_qt_running_for(seconds: float) -> None:
     while time.monotonic() < deadline:
         QApplication.processEvents()
         time.sleep(POLL_INTERVAL_SECONDS)
+
+
+def write_tone(path: Path, level_dbfs: float) -> None:
+    """Write a mono 1 kHz sine wave at ``level_dbfs`` (peak) into the WAV file ``path``."""
+    amplitude = 32767 * 10 ** (level_dbfs / 20)
+    sample_count = int(SAMPLE_RATE * TONE_SECONDS)
+    samples = bytearray()
+    for sample_number in range(sample_count):
+        angle = 2 * math.pi * TONE_FREQUENCY_HZ * sample_number / SAMPLE_RATE
+        sample_value = int(amplitude * math.sin(angle))
+        samples += struct.pack("<h", sample_value)
+    with wave.open(str(path), "wb") as wave_file:
+        wave_file.setnchannels(1)
+        wave_file.setsampwidth(2)
+        wave_file.setframerate(SAMPLE_RATE)
+        wave_file.writeframes(bytes(samples))
+
+
+def rms_dbfs(raw_samples: bytes) -> float:
+    """Return the RMS level of signed 16-bit samples in dBFS, or -inf for silence."""
+    sample_count = len(raw_samples) // 2
+    if sample_count == 0:
+        return -math.inf
+    samples = struct.unpack(f"<{sample_count}h", raw_samples[: sample_count * 2])
+    square_sum = 0
+    for sample in samples:
+        square_sum += sample * sample
+    rms = math.sqrt(square_sum / sample_count)
+    if rms == 0:
+        return -math.inf
+    return 20 * math.log10(rms / 32768)
+
+
+def record_speaker(speaker: AudioDevice) -> bytes:
+    """Record about one second of what ``speaker`` plays, from its monitor."""
+    command = [
+        "timeout", RECORD_SECONDS, "pw-record", "--target", speaker.system_name,
+        "-P", "stream.capture.sink=true", "--format", "s16", "--channels", "1",
+        "--rate", str(SAMPLE_RATE), "-",
+    ]
+    completed_process = subprocess.run(command, capture_output=True)
+    return completed_process.stdout
 
 
 class VirtualDevices:
@@ -169,6 +255,40 @@ class VirtualDevices:
         self._module_ids[device.system_name] = module_id
 
 
+class ToneMicrophone:
+    """A virtual microphone that "hears" whatever is played into TONE_INPUT_NAME.
+
+    It is a pw-loopback from a virtual sink to a virtual source, which is the
+    usual way to make a virtual microphone in PipeWire.
+    """
+
+    def __init__(self) -> None:
+        command = [
+            "pw-loopback", "--name", "m2s_test_tone_microphone",
+            "--capture-props", f"media.class=Audio/Sink node.name={TONE_INPUT_NAME}",
+            "--playback-props", f"media.class=Audio/Source node.name={TONE_MICROPHONE.system_name}",
+        ]
+        self._process = subprocess.Popen(command)
+
+    def play(self, tone_path: Path) -> subprocess.Popen:
+        """Start playing ``tone_path`` into the microphone and return the player process."""
+        command = ["pw-play", "--target", TONE_INPUT_NAME, str(tone_path)]
+        return subprocess.Popen(command)
+
+    def remove(self) -> None:
+        """End the virtual microphone."""
+        self._process.terminate()
+        self._process.wait()
+
+
+@dataclass(frozen=True)
+class ToneFiles:
+    """The two test tones: one below the noise gate's threshold and one well above it."""
+
+    quiet: Path
+    loud: Path
+
+
 class StopRecorder:
     """Collects the reasons passed to an on_stopped callback."""
 
@@ -193,13 +313,33 @@ class ChangeCounter:
 
 @pytest.fixture
 def virtual_devices(qt_application) -> VirtualDevices:
-    """A virtual microphone and two virtual speakers, removed after the test."""
+    """A silent virtual microphone and two virtual speakers, removed after the test."""
     devices = VirtualDevices()
     devices.add_microphone(TEST_MICROPHONE)
     devices.add_speaker(TEST_SPEAKER_A)
     devices.add_speaker(TEST_SPEAKER_B)
     yield devices
     devices.remove_all()
+
+
+@pytest.fixture
+def tone_microphone(virtual_devices) -> ToneMicrophone:
+    """A virtual microphone that test tones can be played into."""
+    microphone = ToneMicrophone()
+    keep_qt_running_for(WATCHER_START_SECONDS)
+    yield microphone
+    microphone.remove()
+
+
+@pytest.fixture(scope="module")
+def tone_files(tmp_path_factory) -> ToneFiles:
+    """A quiet and a loud test tone as WAV files."""
+    tone_directory = tmp_path_factory.mktemp("tones")
+    quiet_path = tone_directory / "quiet.wav"
+    loud_path = tone_directory / "loud.wav"
+    write_tone(quiet_path, QUIET_TONE_DBFS)
+    write_tone(loud_path, LOUD_TONE_DBFS)
+    return ToneFiles(quiet=quiet_path, loud=loud_path)
 
 
 @pytest.fixture
@@ -216,6 +356,15 @@ def device_watcher(qt_application) -> LinuxAudioDeviceWatcher:
     watcher = LinuxAudioDeviceWatcher()
     yield watcher
     watcher.stop()
+
+
+def speaker_level_while_playing(tone_microphone: ToneMicrophone, tone_path: Path) -> float:
+    """Play ``tone_path`` into the tone microphone and return the level that reaches speaker A."""
+    player = tone_microphone.play(tone_path)
+    keep_qt_running_for(TONE_SETTLE_SECONDS)
+    recording = record_speaker(TEST_SPEAKER_A)
+    player.wait()
+    return rms_dbfs(recording)
 
 
 def test_device_provider_lists_the_virtual_devices(virtual_devices):
@@ -236,40 +385,40 @@ def test_device_provider_lists_the_virtual_devices(virtual_devices):
 def test_start_connects_the_chosen_devices_and_stop_disconnects_them(virtual_devices, loopback):
     stop_recorder = StopRecorder()
 
-    loopback.start(TEST_MICROPHONE, TEST_SPEAKER_A, on_stopped=stop_recorder.record)
+    loopback.start(TEST_MICROPHONE, TEST_SPEAKER_A, NO_FILTERS, on_stopped=stop_recorder.record)
 
-    assert wait_until(lambda: playback_sinks() == [TEST_SPEAKER_A.system_name])
-    assert capture_sources() == [TEST_MICROPHONE.system_name]
+    assert wait_until(lambda: sinks_written_by(PLAYBACK_STREAM_NAME) == [TEST_SPEAKER_A.system_name])
+    assert sources_read_by(CAPTURE_STREAM_NAME) == [TEST_MICROPHONE.system_name]
     assert loopback.is_running()
 
     loopback.stop()
 
     assert not loopback.is_running()
-    assert wait_until(lambda: playback_sinks() == [])
+    assert wait_until(lambda: sinks_written_by(PLAYBACK_STREAM_NAME) == [])
     assert stop_recorder.reasons == []
 
 
 def test_starting_again_moves_the_sound_to_the_new_speaker(virtual_devices, loopback):
     stop_recorder = StopRecorder()
-    loopback.start(TEST_MICROPHONE, TEST_SPEAKER_A, on_stopped=stop_recorder.record)
+    loopback.start(TEST_MICROPHONE, TEST_SPEAKER_A, NO_FILTERS, on_stopped=stop_recorder.record)
 
-    loopback.start(TEST_MICROPHONE, TEST_SPEAKER_B, on_stopped=stop_recorder.record)
+    loopback.start(TEST_MICROPHONE, TEST_SPEAKER_B, NO_FILTERS, on_stopped=stop_recorder.record)
 
-    assert wait_until(lambda: playback_sinks() == [TEST_SPEAKER_B.system_name])
+    assert wait_until(lambda: sinks_written_by(PLAYBACK_STREAM_NAME) == [TEST_SPEAKER_B.system_name])
     assert stop_recorder.reasons == []
 
 
 def test_unplugging_the_speaker_stops_the_sound_instead_of_moving_it(virtual_devices, loopback):
     stop_recorder = StopRecorder()
-    loopback.start(TEST_MICROPHONE, TEST_SPEAKER_A, on_stopped=stop_recorder.record)
-    assert wait_until(lambda: playback_sinks() == [TEST_SPEAKER_A.system_name])
+    loopback.start(TEST_MICROPHONE, TEST_SPEAKER_A, NO_FILTERS, on_stopped=stop_recorder.record)
+    assert wait_until(lambda: sinks_written_by(PLAYBACK_STREAM_NAME) == [TEST_SPEAKER_A.system_name])
 
     virtual_devices.unplug(TEST_SPEAKER_A)
 
     assert wait_until(lambda: stop_recorder.reasons != [])
     assert stop_recorder.reasons == [LinuxAudioLoopback.DEVICE_GONE_REASON]
     assert not loopback.is_running()
-    assert playback_sinks() == []
+    assert sinks_written_by(PLAYBACK_STREAM_NAME) == []
 
 
 def test_sound_stops_when_the_app_is_killed(virtual_devices):
@@ -280,12 +429,114 @@ def test_sound_stops_when_the_app_is_killed(virtual_devices):
     app_process = subprocess.Popen(command, stdout=subprocess.PIPE, text=True, cwd=PROJECT_DIR)
     first_line = app_process.stdout.readline()
     assert first_line.strip() == "STARTED"
-    assert wait_until(lambda: playback_sinks() == [TEST_SPEAKER_A.system_name])
+    assert wait_until(lambda: sinks_written_by(PLAYBACK_STREAM_NAME) == [TEST_SPEAKER_A.system_name])
 
     app_process.kill()
     app_process.wait()
 
-    assert wait_until(lambda: playback_sinks() == [])
+    assert wait_until(lambda: sinks_written_by(PLAYBACK_STREAM_NAME) == [])
+
+
+def test_volume_is_applied_at_start_and_while_playing(virtual_devices, loopback):
+    stop_recorder = StopRecorder()
+    loopback.set_volume(40)
+
+    loopback.start(TEST_MICROPHONE, TEST_SPEAKER_A, NO_FILTERS, on_stopped=stop_recorder.record)
+
+    assert wait_until(lambda: playback_volume_text() == "40%")
+
+    loopback.set_volume(70)
+
+    assert wait_until(lambda: playback_volume_text() == "70%")
+
+
+def test_noise_gate_and_shifter_sit_between_the_microphone_and_the_speaker(virtual_devices, loopback):
+    stop_recorder = StopRecorder()
+    filters = AudioFilters(noise_gate=True, frequency_shifter=True)
+
+    loopback.start(TEST_MICROPHONE, TEST_SPEAKER_A, filters, on_stopped=stop_recorder.record)
+
+    assert wait_until(lambda: sinks_written_by(PLAYBACK_STREAM_NAME) == [TEST_SPEAKER_A.system_name])
+    assert sources_read_by(CAPTURE_STREAM_NAME) == [FILTERED_MICROPHONE_NAME]
+    assert sources_read_by(FILTERS_CAPTURE_NAME) == [TEST_MICROPHONE.system_name]
+
+
+def test_echo_canceller_compares_the_microphone_with_the_speaker(virtual_devices, loopback):
+    stop_recorder = StopRecorder()
+    filters = AudioFilters(echo_canceller=True)
+
+    loopback.start(TEST_MICROPHONE, TEST_SPEAKER_A, filters, on_stopped=stop_recorder.record)
+
+    assert wait_until(lambda: sinks_written_by(PLAYBACK_STREAM_NAME) == [TEST_SPEAKER_A.system_name])
+    assert sources_read_by(CAPTURE_STREAM_NAME) == [ECHO_CANCEL_SOURCE_NAME]
+    assert sources_read_by(ECHO_CANCEL_CAPTURE_NAME) == [TEST_MICROPHONE.system_name]
+    monitor_of_speaker_a = TEST_SPEAKER_A.system_name + ".monitor"
+    assert sources_read_by(ECHO_CANCEL_REFERENCE_NAME) == [monitor_of_speaker_a]
+
+
+def test_stop_ends_the_filter_process_and_its_virtual_devices(virtual_devices, loopback):
+    stop_recorder = StopRecorder()
+    loopback.start(TEST_MICROPHONE, TEST_SPEAKER_A, ALL_FILTERS, on_stopped=stop_recorder.record)
+    assert wait_until(lambda: sinks_written_by(PLAYBACK_STREAM_NAME) == [TEST_SPEAKER_A.system_name])
+
+    loopback.stop()
+
+    assert child_process_ids("pipewire -c") == []
+    assert wait_until(lambda: own_virtual_devices() == [])
+    assert stop_recorder.reasons == []
+
+
+def test_unplugging_the_speaker_with_all_filters_stops_everything(virtual_devices, loopback):
+    stop_recorder = StopRecorder()
+    loopback.start(TEST_MICROPHONE, TEST_SPEAKER_A, ALL_FILTERS, on_stopped=stop_recorder.record)
+    assert wait_until(lambda: sinks_written_by(PLAYBACK_STREAM_NAME) == [TEST_SPEAKER_A.system_name])
+
+    virtual_devices.unplug(TEST_SPEAKER_A)
+
+    assert wait_until(lambda: stop_recorder.reasons != [])
+    assert not loopback.is_running()
+    assert child_process_ids("pipewire -c") == []
+    assert wait_until(lambda: own_virtual_devices() == [])
+
+
+def test_unplugging_the_microphone_with_filters_stops_everything(virtual_devices, loopback):
+    stop_recorder = StopRecorder()
+    filters = AudioFilters(noise_gate=True)
+    loopback.start(TEST_MICROPHONE, TEST_SPEAKER_A, filters, on_stopped=stop_recorder.record)
+    assert wait_until(lambda: sinks_written_by(PLAYBACK_STREAM_NAME) == [TEST_SPEAKER_A.system_name])
+
+    virtual_devices.unplug(TEST_MICROPHONE)
+
+    assert wait_until(lambda: stop_recorder.reasons != [])
+    assert not loopback.is_running()
+    assert child_process_ids("pipewire -c") == []
+
+
+def test_noise_gate_blocks_a_quiet_tone_and_passes_a_loud_one(tone_microphone, tone_files, loopback):
+    stop_recorder = StopRecorder()
+    filters = AudioFilters(noise_gate=True)
+    loopback.start(TONE_MICROPHONE, TEST_SPEAKER_A, filters, on_stopped=stop_recorder.record)
+    assert wait_until(lambda: sinks_written_by(PLAYBACK_STREAM_NAME) == [TEST_SPEAKER_A.system_name])
+
+    quiet_level = speaker_level_while_playing(tone_microphone, tone_files.quiet)
+    loud_level = speaker_level_while_playing(tone_microphone, tone_files.loud)
+
+    assert quiet_level < -100
+    assert loud_level > LOUD_TONE_DBFS - 10
+
+
+def test_frequency_shifter_keeps_the_volume(tone_microphone, tone_files, loopback):
+    stop_recorder = StopRecorder()
+    loopback.start(TONE_MICROPHONE, TEST_SPEAKER_A, NO_FILTERS, on_stopped=stop_recorder.record)
+    assert wait_until(lambda: sinks_written_by(PLAYBACK_STREAM_NAME) == [TEST_SPEAKER_A.system_name])
+    level_without_filter = speaker_level_while_playing(tone_microphone, tone_files.loud)
+
+    filters = AudioFilters(frequency_shifter=True)
+    loopback.start(TONE_MICROPHONE, TEST_SPEAKER_A, filters, on_stopped=stop_recorder.record)
+    assert wait_until(lambda: sinks_written_by(PLAYBACK_STREAM_NAME) == [TEST_SPEAKER_A.system_name])
+    level_with_filter = speaker_level_while_playing(tone_microphone, tone_files.loud)
+
+    assert abs(level_with_filter - level_without_filter) < 2
 
 
 def test_watcher_reports_a_device_being_plugged_in_and_out(virtual_devices, device_watcher):
@@ -307,8 +558,8 @@ def test_watcher_ignores_the_apps_own_sound(virtual_devices, device_watcher, loo
     keep_qt_running_for(WATCHER_START_SECONDS)
     stop_recorder = StopRecorder()
 
-    loopback.start(TEST_MICROPHONE, TEST_SPEAKER_A, on_stopped=stop_recorder.record)
-    assert wait_until(lambda: playback_sinks() == [TEST_SPEAKER_A.system_name])
+    loopback.start(TEST_MICROPHONE, TEST_SPEAKER_A, NO_FILTERS, on_stopped=stop_recorder.record)
+    assert wait_until(lambda: sinks_written_by(PLAYBACK_STREAM_NAME) == [TEST_SPEAKER_A.system_name])
     loopback.stop()
     keep_qt_running_for(1.0)
 
@@ -319,13 +570,13 @@ def test_watcher_comes_back_after_pactl_subscribe_dies(virtual_devices, device_w
     change_counter = ChangeCounter()
     device_watcher.start(on_devices_changed=change_counter.record)
     keep_qt_running_for(WATCHER_START_SECONDS)
-    first_process_id = our_pactl_subscribe_process_id()
-    assert first_process_id is not None
+    first_process_ids = child_process_ids("pactl subscribe")
+    assert len(first_process_ids) == 1
 
-    os.kill(first_process_id, signal.SIGKILL)
+    os.kill(first_process_ids[0], signal.SIGKILL)
 
     # After the restart the watcher reports one change, so the lists are read again.
     assert wait_until(lambda: change_counter.count >= 1, timeout_seconds=WATCHER_RESTART_TIMEOUT_SECONDS)
-    second_process_id = our_pactl_subscribe_process_id()
-    assert second_process_id is not None
-    assert second_process_id != first_process_id
+    second_process_ids = child_process_ids("pactl subscribe")
+    assert len(second_process_ids) == 1
+    assert second_process_ids != first_process_ids

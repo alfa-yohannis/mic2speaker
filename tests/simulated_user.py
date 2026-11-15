@@ -5,21 +5,26 @@ from PyQt5.QtWidgets import QAction
 from mic2speaker.ui.device_combo_box import DeviceComboBox
 from mic2speaker.ui.main_window import MainWindow
 from mic2speaker.ui.toggle_button import ToggleButton
+from mic2speaker.ui.volume_slider import VolumeSlider
 
 
 class SimulatedUser:
     """Clicks, picks, and reads on a MainWindow, so tests read like user actions.
 
-    The widgets are looked up by their object names, so the tests do not
-    depend on the window's private attributes.
+    The widgets and menu items are looked up by their object names, so the
+    tests do not depend on the window's private attributes.
     """
 
     def __init__(self, window: MainWindow) -> None:
         self._window = window
         self._microphone_combo = window.findChild(DeviceComboBox, MainWindow.MICROPHONE_COMBO_NAME)
         self._speaker_combo = window.findChild(DeviceComboBox, MainWindow.SPEAKER_COMBO_NAME)
+        self._volume_slider = window.findChild(VolumeSlider, MainWindow.VOLUME_SLIDER_NAME)
         self._toggle_button = window.findChild(ToggleButton, MainWindow.TOGGLE_BUTTON_NAME)
         self._redetect_action = window.findChild(QAction, MainWindow.REDETECT_ACTION_NAME)
+        self._echo_canceller_action = window.findChild(QAction, MainWindow.ECHO_CANCELLER_ACTION_NAME)
+        self._frequency_shifter_action = window.findChild(QAction, MainWindow.FREQUENCY_SHIFTER_ACTION_NAME)
+        self._noise_gate_action = window.findChild(QAction, MainWindow.NOISE_GATE_ACTION_NAME)
 
     def click_toggle(self) -> None:
         """Click the ON/OFF button once."""
@@ -28,6 +33,22 @@ class SimulatedUser:
     def redetect_devices(self) -> None:
         """Choose Devices > Redetect inputs and outputs."""
         self._redetect_action.trigger()
+
+    def toggle_echo_canceller(self) -> None:
+        """Tick or untick Filters > Echo canceller."""
+        self._echo_canceller_action.trigger()
+
+    def toggle_frequency_shifter(self) -> None:
+        """Tick or untick Filters > Frequency shifter."""
+        self._frequency_shifter_action.trigger()
+
+    def toggle_noise_gate(self) -> None:
+        """Tick or untick Filters > Noise gate."""
+        self._noise_gate_action.trigger()
+
+    def set_volume(self, volume_percent: int) -> None:
+        """Drag the volume slider to ``volume_percent``."""
+        self._volume_slider.set_volume(volume_percent)
 
     def pick_microphone(self, display_name: str) -> None:
         """Choose the microphone called ``display_name`` in the dropdown."""
@@ -44,6 +65,10 @@ class SimulatedUser:
     def toggle_text(self) -> str:
         """Return the text on the toggle: "ON" or "OFF"."""
         return self._toggle_button.text()
+
+    def volume_text(self) -> str:
+        """Return the text next to the volume slider, for example "80%"."""
+        return self._volume_slider.value_text()
 
     def status_text(self) -> str:
         """Return the message in the status bar."""

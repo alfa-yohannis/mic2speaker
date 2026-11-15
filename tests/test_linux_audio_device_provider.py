@@ -13,6 +13,7 @@ SOURCES = [
     {"name": "alsa_output.usb.monitor", "description": "Monitor of USB Speaker", "properties": {"device.class": "monitor"}},
     {"name": "alsa_input.builtin", "description": "Built-in Microphone", "properties": {"device.class": "sound"}},
     {"name": "alsa_input.usb", "description": "USB Microphone", "properties": {"device.class": "sound"}},
+    {"name": "mic2speaker_filtered_microphone", "description": "Mic2Speaker filtered microphone", "properties": {}},
 ]
 SINKS = [
     {"name": "alsa_output.builtin", "description": "Built-in Speaker", "properties": {"device.class": "sound"}},
@@ -58,6 +59,13 @@ def provider(monkeypatch) -> LinuxAudioDeviceProvider:
     fake_pactl = FakePactl(PACTL_ANSWERS)
     monkeypatch.setattr(subprocess, "run", fake_pactl.run)
     return LinuxAudioDeviceProvider()
+
+
+def test_microphones_leave_out_mic2speakers_own_virtual_devices(provider):
+    microphones = provider.list_microphones()
+
+    microphone_names = [device.system_name for device in microphones]
+    assert "mic2speaker_filtered_microphone" not in microphone_names
 
 
 def test_microphones_leave_out_the_monitor_sources(provider):

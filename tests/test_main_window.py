@@ -3,6 +3,7 @@
 import pytest
 
 from mic2speaker.audio.audio_device import AudioDevice
+from mic2speaker.audio.audio_filters import AudioFilters
 from mic2speaker.ui.main_window import MainWindow
 from tests.fakes import FakeAudioLoopback, FakeDeviceProvider, FakeDeviceWatcher
 from tests.simulated_user import SimulatedUser
@@ -166,6 +167,83 @@ class TestRedetecting:
         device_watcher.report_change()
 
         assert user.status_text() == f"The sound stopped: {DEVICE_GONE_REASON}"
+
+
+class TestFilters:
+    def test_sound_starts_without_filters_by_default(self, user, audio_loopback):
+        user.click_toggle()
+
+        assert audio_loopback.started_filters == [AudioFilters()]
+
+    def test_ticking_a_filter_while_on_restarts_the_sound_with_it(self, user, audio_loopback):
+        user.click_toggle()
+
+        user.toggle_noise_gate()
+
+        assert audio_loopback.started_filters == [AudioFilters(), AudioFilters(noise_gate=True)]
+        assert user.status_text() == "Playing USB Microphone through USB Speaker (filters: noise gate)."
+
+    def test_ticking_a_filter_while_off_takes_effect_at_the_next_start(self, user, audio_loopback):
+        user.toggle_echo_canceller()
+
+        assert audio_loopback.started_filters == []
+
+        user.click_toggle()
+
+        assert audio_loopback.started_filters == [AudioFilters(echo_canceller=True)]
+
+    def test_status_bar_names_every_ticked_filter(self, user):
+        user.toggle_echo_canceller()
+        user.toggle_frequency_shifter()
+        user.toggle_noise_gate()
+
+        user.click_toggle()
+
+        assert user.status_text() == (
+            "Playing USB Microphone through USB Speaker "
+            "(filters: echo canceller, frequency shifter, noise gate)."
+        )
+
+    def test_unticking_a_filter_while_on_restarts_the_sound_without_it(self, user, audio_loopback):
+        user.toggle_frequency_shifter()
+        user.click_toggle()
+
+        user.toggle_frequency_shifter()
+
+        assert audio_loopback.started_filters == [AudioFilters(frequency_shifter=True), AudioFilters()]
+
+    def test_missing_filter_turns_the_toggle_back_off_and_says_why(self, user, audio_loopback):
+        audio_loopback.start_error_message = "gate_1410.so was not found."
+        user.toggle_noise_gate()
+
+        user.click_toggle()
+
+        assert user.toggle_text() == "OFF"
+        assert user.status_text() == "Could not start the sound: gate_1410.so was not found."
+
+
+class TestVolume:
+    def test_volume_starts_at_100_percent(self, user, audio_loopback):
+        assert audio_loopback.volume_percent == 100
+        assert user.volume_text() == "100%"
+
+    def test_moving_the_slider_changes_the_volume(self, user, audio_loopback):
+        user.set_volume(40)
+
+        assert audio_loopback.volume_percent == 40
+        assert user.volume_text() == "40%"
+
+    def test_volume_can_go_above_100_percent(self, user, audio_loopback):
+        user.set_volume(150)
+
+        assert audio_loopback.volume_percent == 150
+
+    def test_volume_error_is_shown_in_the_status_bar(self, user, audio_loopback):
+        audio_loopback.volume_error_message = "pactl failed: No such entity"
+
+        user.set_volume(50)
+
+        assert user.status_text() == "Could not change the volume: pactl failed: No such entity"
 
 
 class TestUnexpectedStop:

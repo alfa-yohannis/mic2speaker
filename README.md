@@ -1,6 +1,6 @@
 # Mic2Speaker
 
-Mic2Speaker is a small desktop app that plays a microphone through a speaker on the same computer. Pick the input and the output, switch the toggle ON, and your voice comes out of the speaker with about 10 ms of buffering. Switch it OFF to stop.
+Mic2Speaker is a small desktop app that plays a microphone through a speaker on the same computer. Pick the input and the output, switch the toggle ON, and your voice comes out of the speaker with about 10 ms of buffering. Switch it OFF to stop. A volume slider and three optional filters help keep the speaker from howling when it can hear the microphone.
 
 ![Mic2Speaker main window](docs/images/main-window.png)
 
@@ -13,12 +13,15 @@ These steps take a Linux machine from nothing to hearing your own voice. They we
 1. Install the system tools:
 
    ```bash
-   sudo apt install pipewire-bin pulseaudio-utils util-linux python3 python3-venv
+   sudo apt install pipewire-bin libpipewire-0.3-modules libspa-0.2-modules \
+       pulseaudio-utils util-linux swh-plugins python3 python3-venv
    ```
 
    | Tool | Package | Used for |
    |---|---|---|
-   | `pw-loopback` | `pipewire-bin` | copies the sound from the microphone to the speaker |
+   | `pw-loopback`, `pipewire` | `pipewire-bin` | copy the sound from the microphone to the speaker, and run the filters |
+   | PipeWire's echo canceller and filter chain | `libpipewire-0.3-modules`, `libspa-0.2-modules` | the Filters menu |
+   | LADSPA gate and Bode frequency shifter | `swh-plugins` | Filters > Noise gate and Frequency shifter |
    | `pactl` | `pulseaudio-utils` | lists the microphones and speakers |
    | `setpriv` | `util-linux` | stops the sound if the app crashes (recommended) |
    | Python 3.10 or newer, with `venv` | `python3`, `python3-venv` | runs the app |
@@ -47,14 +50,29 @@ These steps take a Linux machine from nothing to hearing your own voice. They we
 
 - Both lists mark the system default device with "(default)" and select it when the app starts.
 - Click the toggle to switch the sound ON or OFF. Closing the window also stops the sound.
+- The Volume slider sets how loud the speaker plays the microphone, from 0 to 150 %. It takes effect at once.
+- The Filters menu switches the echo canceller, the frequency shifter, and the noise gate on and off. While the sound is on, a change takes effect at once, and the status bar lists the active filters.
 - While the sound is on, picking another device in either list moves the sound to it right away.
 - The lists update by themselves when a device is plugged in or out, or when the system default device changes. Devices > Redetect inputs and outputs (F5) reads them again by hand and says how many devices it found.
 - If a device in use is unplugged, the sound stops and is never moved to another speaker. The toggle goes back to OFF and the status bar says why.
 - If the app crashes or is killed, the sound stops with it.
 
-### Tips
+### Reducing echo and feedback
 
-- Keep the microphone away from the speaker, or use headphones. A microphone that hears its own speaker makes a loud whistle (feedback).
+A microphone that hears its own speaker sends the sound around in a loop, which you hear as an echo or as a loud howl (feedback). Headphones, or more distance between the microphone and the speaker, stop the loop completely. The app can only make it weaker:
+
+| Measure | What it does | Cost |
+|---|---|---|
+| Volume slider | a lower volume makes the loop weaker; below a certain level the howl stops | quieter sound |
+| Noise gate | mutes the microphone while nobody speaks, so the loop cannot build up in pauses | no help while you talk; very soft speech may be cut off |
+| Frequency shifter | shifts the sound up 5 Hz, so that a howl cannot settle on one room resonance; this usually allows a few dB more volume | barely audible on speech |
+| Echo canceller (WebRTC) | removes the speaker's sound from the microphone signal, with noise suppression | experimental: in this loop the "echo" is your own voice, so it may also weaken or chop your voice |
+
+A good order to try: lower the volume until the howl stops, tick the noise gate and the frequency shifter, then raise the volume again slowly.
+
+### Other tips
+
+- Filter and volume choices are not saved. The app always starts with no filters and the volume at 100 %.
 - If the sound crackles, raise `LATENCY_MS` in [mic2speaker/audio/linux_audio_loopback.py](mic2speaker/audio/linux_audio_loopback.py) from 10 to 20. Lower values give less delay.
 - The PyQt5 from pip brings its own copy of Qt, so the window uses Qt's Fusion style rather than your desktop theme.
 
@@ -71,16 +89,22 @@ These steps take a Linux machine from nothing to hearing your own voice. They we
 │   ├── app.py                picks the audio adapters for this OS and opens the window
 │   ├── audio/
 │   │   ├── audio_device.py                  AudioDevice: one microphone or speaker
+│   │   ├── audio_filters.py                 AudioFilters: which filters are switched on
 │   │   ├── audio_device_provider.py         AudioDeviceProvider interface
 │   │   ├── audio_device_watcher.py          AudioDeviceWatcher interface
 │   │   ├── audio_loopback.py                AudioLoopback interface
 │   │   ├── linux_audio_device_provider.py   Linux adapter, lists devices with pactl
 │   │   ├── linux_audio_device_watcher.py    Linux adapter, watches pactl subscribe
-│   │   ├── linux_audio_loopback.py          Linux adapter, runs pw-loopback
-│   │   └── linux_child_process.py           makes helper programs end with the app
+│   │   ├── linux_audio_loopback.py          Linux adapter, runs pw-loopback and sets the volume
+│   │   ├── linux_filter_config.py           builds the PipeWire config for the filters
+│   │   ├── linux_filter_process.py          runs the filters in a "pipewire -c" process
+│   │   ├── linux_child_process.py           makes helper programs end with the app
+│   │   ├── linux_node_names.py              names of the PipeWire nodes the app creates
+│   │   └── linux_pactl.py                   runs pactl for the Linux adapters
 │   └── ui/
-│       ├── main_window.py        the form: menus, dropdowns, toggle, status bar
+│       ├── main_window.py        the form: menus, dropdowns, volume, toggle, status bar
 │       ├── device_combo_box.py   dropdown of AudioDevice items
+│       ├── volume_slider.py      volume slider with its value in percent
 │       └── toggle_button.py      the big ON/OFF button
 ├── tests/
 └── docs/
@@ -98,9 +122,10 @@ These steps take a Linux machine from nothing to hearing your own voice. They we
 | `tests/test_main_window.py` | the form, driven through `SimulatedUser` with fake adapters | no |
 | `tests/test_linux_audio_device_provider.py` | how pactl's output is read, with pactl's answers faked | no |
 | `tests/test_linux_audio_device_watcher.py` | which `pactl subscribe` lines count as device changes | no |
-| `tests/test_linux_audio_integration.py` | the three Linux adapters against the real PipeWire server | PipeWire, but no sound |
+| `tests/test_linux_filter_config.py` | the PipeWire config built for each combination of filters | no |
+| `tests/test_linux_audio_integration.py` | the Linux adapters and filters against the real PipeWire server, including test tones through the noise gate and the frequency shifter | PipeWire, but no sound |
 
-The integration tests create temporary virtual devices (a silent microphone and two speakers that play into nothing), so nothing reaches your real speakers, and they remove them afterwards. They carry the `integration` marker: skip them with `-m "not integration"`. They skip themselves when `pactl` or `pw-loopback` is missing.
+The integration tests create temporary virtual devices (silent microphones, a microphone that plays test tones, and speakers that play into nothing), so nothing reaches your real speakers, and they remove them afterwards. They carry the `integration` marker: skip them with `-m "not integration"`. They skip themselves when `pactl` or `pw-loopback` is missing.
 
 ## Documentation
 
